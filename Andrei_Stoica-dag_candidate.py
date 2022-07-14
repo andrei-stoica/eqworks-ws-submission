@@ -1,9 +1,12 @@
 #from msilib.schema import tables
+from contextlib import contextmanager
 import os
 import random
 from typing import List
 
 import sqlalchemy
+import sqlalchemy.orm 
+from sqlalchemy.ext.declarative import declarative_base
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.utils.dates import days_ago
@@ -65,6 +68,26 @@ random.seed()
 
 # Helper functions/classes ####################################################
 
+Base = declarative_base()
+
+class Job(Base):
+    """Object for JOB TABLE"""
+    __tablename__ = JOB_TABLE_NAME
+    id = sqlalchemy.Column(sqlalchemy.Integer, primary_key=True)
+    is_active = sqlalchemy.Column(sqlalchemy.Boolean,
+                                  nullable=False,
+                                  default=True)
+
+class JobResult(Base):
+    """Object for JOB RESULT TABLE"""
+    __tablename__ = JOB_RESULT_TABLE_NAME
+    job_id = sqlalchemy.Column(sqlalchemy.Integer,
+                               sqlalchemy.ForeignKey(f"{JOB_TABLE_NAME}.id"),
+                               unique = True,
+                               primary_key = True)
+    is_gt_th = sqlalchemy.Column(sqlalchemy.Boolean)
+    is_successful = sqlalchemy.Column(sqlalchemy.Boolean)
+
 def get_rand_digit() -> int:
     """Return a random digit between 0 and 9 (inclusive)."""
     return random.randint(0, 9)
@@ -83,25 +106,31 @@ def get_id(instance) -> int:
     "returns the id generated in [TASK_ID_INSERT_RECS]"
     return instance.xcom_pull(key = 'id', task_ids = [TASK_ID_INSERT_RECS])[0]
 
+@contextmanager
+def session_scope() -> sqlalchemy.orm.Session:
+    """Manages the session scope"""
+    session = sqlalchemy.orm.Session(get_engine())
+    try:
+        yield session
+        session.commit()
+    except:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
-def gen_update_query(table, where_col,  **values) -> sqlalchemy.text:
-    """returns an SQL quere for updating a table with the values supplied.
-
-    Args:
-        table       (str) : name of the tabe to be updated
-        where_col   (str) : column name for where clause
-        values            : new set of values
-
-    Returns:
-        sqlalchemy.text   : Generated SQL UPDATE query
-    """
-    update = f"UPDATE {table} SET "
-    cols = [f"{col} = {values[col]}" for col in values]
-    where = f" WHERE {where_col} = :id"
+Session = sqlalchemy.orm.sessionmaker(get_engine())
+def update_job_records(id, is_successful, is_gt_th = None):
+    """Updates both tables when a job finishes"""
+    with session_scope() as session:
+        session.execute(sqlalchemy.update(Job).
+                        where(Job.id == id).
+                        values(is_active = False))
+        session.execute(sqlalchemy.update(JobResult).
+                        where(JobResult.job_id == id).
+                        values(is_successful = is_successful,
+                               is_gt_th = is_gt_th))
     
-    return sqlalchemy.text(update + ", ".join(cols) + where)
-
-
 
 # Functions for the tasks in the DAG ##########################################
 
@@ -119,10 +148,7 @@ def create_tables(**kwargs) -> None:
     The tables can be created either by executing the provided raw query,
     or by using ORM (based on the information in the provided query).
     """
-
-    with get_engine().begin() as conn:
-        conn.execute(sqlalchemy.text(QUERY_JOB_TABLE_CREATION))
-        conn.execute(sqlalchemy.text(QUERY_JOB_RESULT_TABLE_CREATION))
+    Base.metadata.create_all(get_engine())
 
 
 def insert_recs(**kwargs) -> None:
@@ -153,15 +179,13 @@ def insert_recs(**kwargs) -> None:
         INSERT INTO {JOB_RESULT_TABLE_NAME}(job_id) 
         VALUES (:id);
     """
-    
-    with get_engine().begin() as conn:
-        result = conn.execute(sqlalchemy.text(query_insert_job_table))
-        id = result.first()['id']
-        
-        conn.execute(sqlalchemy.text(query_insert_job_result_table), id = id)
-    
-    task_instance.xcom_push(key = 'job_id', value = id)
+    with session_scope() as session:
+        job = Job()
+        session.add(job)
+        session.flush() 
 
+        session.add(JobResult(job_id = job.id))
+        task_instance.xcom_push(key = 'job_id', value = job.id)
 
 def get_hit_count(
         num_str: str,
@@ -247,15 +271,7 @@ def action_on_gt_threshold(**kwargs) -> None:
     """
     id = get_id(kwargs['task_instance'])
 
-    with get_engine().begin() as conn:
-        conn.execute(gen_update_query(JOB_TABLE_NAME, 'id', is_active = 'FALSE'),
-                     id = id)
-
-        conn.execute(gen_update_query(JOB_RESULT_TABLE_NAME,
-                                      'job_id',
-                                      is_successful = "TRUE",
-                                      is_gt_th = 'TRUE'),
-                     id = id)
+    update_job_records(id, is_successful=True, is_gt_th=True)
                                       
 
 def action_on_lte_threshold(**kwargs) -> None:
@@ -278,15 +294,7 @@ def action_on_lte_threshold(**kwargs) -> None:
     """
     id = get_id(kwargs['task_instance'])
 
-    with get_engine().begin() as conn:
-        conn.execute(gen_update_query(JOB_TABLE_NAME, 'id', is_active = 'FALSE'),
-                     id = id)
-
-        conn.execute(gen_update_query(JOB_RESULT_TABLE_NAME,
-                                      'job_id',
-                                      is_successful = 'TRUE',
-                                      is_gt_th = 'FALSE'),
-                     id = id)
+    update_job_records(id, is_successful=True, is_gt_th=False)
 
 
 def action_on_error(**kwargs) -> None:
@@ -308,15 +316,7 @@ def action_on_error(**kwargs) -> None:
     """
     id = get_id(kwargs['task_instance'])
 
-    with get_engine().begin() as conn:
-        conn.execute(gen_update_query(JOB_TABLE_NAME, 'id', is_active = 'FALSE'),
-                     id = id)
-
-        conn.execute(gen_update_query(JOB_RESULT_TABLE_NAME,
-                                      'job_id',
-                                      is_successful = 'FALSE'),
-                     id = id)
-        
+    update_job_records(id, is_successful=False)
 
 
 
